@@ -324,12 +324,70 @@ def _resolve_path(path: str, what: str) -> str:
             if base:
                 cands.append(os.path.join(base, path))
         cands.append(os.path.abspath(path))
+        # ComfyUI's registered folder categories. A deployment may stage
+        # weights on a network volume that is registered as a folder type
+        # rather than living under models_dir, so ask the registry too.
+        if fp is not None:
+            head = path.replace("\\", "/").split("/")[0]
+            rest = path.replace("\\", "/").split("/")[1:]
+            try:
+                for root in fp.get_folder_paths(head) or []:
+                    cands.append(os.path.join(root, *rest) if rest else root)
+            except Exception:
+                pass
+            for cat in ("diffusion_models", "checkpoints", "vae", "unet"):
+                try:
+                    for root in fp.get_folder_paths(cat) or []:
+                        cands.append(os.path.join(root, path))
+                        cands.append(os.path.join(root, os.path.basename(path)))
+                except Exception:
+                    pass
+
     for c in cands:
         if os.path.exists(c):
             return os.path.abspath(c)
     raise FileNotFoundError(
         f"{what} not found. Tried: " + ", ".join(cands)
+        + " || " + _layout_report(os.path.basename(path))
     )
+
+
+def _layout_report(basename: str) -> str:
+    """Describe what IS on disk, so a single failed job reveals the real layout.
+
+    Without shell access to a deployment, a not-found error that only says
+    what it looked for costs a full build-release-deploy cycle to learn
+    nothing. This reports what actually exists instead.
+    """
+    import glob
+
+    fp = _folder_paths()
+    bits = []
+    if fp is not None:
+        md = getattr(fp, "models_dir", None)
+        bits.append(f"models_dir={md}")
+        bits.append(f"base_path={getattr(fp, 'base_path', None)}")
+        if md and os.path.isdir(md):
+            try:
+                bits.append("models_dir entries=" + ",".join(sorted(os.listdir(md))[:40]))
+            except Exception as e:
+                bits.append(f"models_dir unreadable: {e}")
+        try:
+            names = sorted(getattr(fp, "folder_names_and_paths", {}).keys())
+            bits.append("registered categories=" + ",".join(names[:40]))
+        except Exception:
+            pass
+    hits = []
+    for root in ("/app/ComfyUI/models", "/app/models", "/models", "/workspace/models",
+                 "/runpod-volume", "/app/ComfyUI"):
+        if not os.path.isdir(root):
+            continue
+        try:
+            hits += glob.glob(os.path.join(root, "**", basename), recursive=True)[:3]
+        except Exception:
+            pass
+    bits.append("found-by-search=" + (",".join(hits[:5]) if hits else "NONE"))
+    return " | ".join(bits)
 
 
 def _read_yaml(path: str) -> dict:
