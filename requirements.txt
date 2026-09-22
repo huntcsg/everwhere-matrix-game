@@ -1,0 +1,19 @@
+# numpy==1.6.0 upstream is a typo (that release is from 2011 and predates
+# every other pin here); torch 2.5 needs numpy<2 at runtime.
+numpy>=1.26,<2
+diffusers==0.32.2
+einops==0.8.1
+ftfy==6.3.1
+imageio==2.34.0
+imageio-ffmpeg
+opencv-python-headless==4.9.0.80
+packaging==25.0
+peft==0.14.0
+Pillow==11.2.1
+regex==2024.11.6
+safetensors==0.5.3
+transformers==4.47.1
+# torch/torchvision/torchaudio deliberately unpinned: the build's base image
+# supplies a CUDA-matched build, and pinning 2.5.1 here would fight it.
+# flash_attn also dropped -- it needs a compiler at install time and the
+# attention path falls back to sdpa without it.
