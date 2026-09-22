@@ -1,8 +1,8 @@
 # Matrix-Game 2.0 node notes
 
 Everything here was read out of the official source, not inferred. Upstream
-paths below are relative to `Matrix-Game-2/` (vendored verbatim under
-`mg2/Matrix-Game-2/`, see "Vendored source").
+paths below are relative to `Matrix-Game-2/` (vendored under
+`mg2/Matrix-Game-2/`; two files carry a local patch, see "Vendored source").
 
 Nodes: `MatrixGame2PipelineLoader`, `MatrixGame2ActionSequence`,
 `MatrixGame2ActionSampler` in `../matrixgame2_nodes.py`.
