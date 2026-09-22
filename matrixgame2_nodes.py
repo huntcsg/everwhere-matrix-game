@@ -1136,3 +1136,45 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+
+
+class MatrixGame2LoadImageBase64:
+    """Decode a base64 PNG/JPEG into an IMAGE.
+
+    The deployment data plane exposes only ``/api/v2/jobs`` -- there is no
+    upload endpoint (``/api/v2/assets``, ``/files``, ``/upload`` all 404), so
+    the only way to get a caller-supplied frame into a graph is inside the
+    request body. That is what makes clip *chaining* possible: the last frame
+    of clip N becomes the start frame of clip N+1, which is the difference
+    between a continuous walk and a menu of disconnected clips.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"data": ("STRING", {"multiline": True, "default": ""})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "decode"
+    CATEGORY = "Matrix-Game2"
+
+    def decode(self, data):
+        import base64
+        import io
+
+        import numpy as np
+        import torch  # deferred like every other heavy import in this module
+        from PIL import Image
+
+        raw = (data or "").strip()
+        if not raw:
+            raise ValueError("data is empty")
+        if raw.startswith("data:"):  # tolerate a data: URL
+            raw = raw.split(",", 1)[-1]
+        img = Image.open(io.BytesIO(base64.b64decode(raw))).convert("RGB")
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        return (torch.from_numpy(arr).unsqueeze(0),)
+
+
+NODE_CLASS_MAPPINGS["MatrixGame2LoadImageBase64"] = MatrixGame2LoadImageBase64
+NODE_DISPLAY_NAME_MAPPINGS["MatrixGame2LoadImageBase64"] = "Matrix-Game 2 Load Image (base64)"
