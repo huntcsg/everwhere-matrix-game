@@ -130,17 +130,34 @@ def _install_flash_attn_shim():
         return out.transpose(1, 2)
 
     def flash_attn_varlen_func(*_a, **_k):
+        # Deliberately a tripwire, not a fallback. Both vendored attention.py
+        # files detect this shim (SDPA_SHIM / __version__ "0.0.0"), report
+        # FLASH_ATTN_2_AVAILABLE = False, and take their own SDPA path, so
+        # nothing should call this. Reimplementing varlen packing here would
+        # silently paper over a future caller that this shim gets wrong --
+        # and wrong attention is wrong video, which is worse than a crash.
         raise RuntimeError(
-            "flash_attn_varlen_func has no SDPA equivalent with the same "
-            "signature; wan.modules.attention.attention() already falls back "
-            "to SDPA, so this path should not be reached."
+            "flash_attn_varlen_func reached the SDPA shim. Both "
+            "wan/modules/attention.py and wan/vae/wanx_vae_src/attention.py "
+            "are patched to route around it; a new caller needs the same "
+            "treatment, or a real varlen implementation honouring "
+            "cu_seqlens_q/cu_seqlens_k and the packed return layout."
+        )
+
+    def flash_attn_qkvpacked_func(*_a, **_k):
+        # Not an alias for flash_attn_func: the real one takes a single packed
+        # [B, L, 3, H, D] tensor, so aliasing it would be a wrong-signature
+        # trap. Nothing in this tree calls it (`grep -rn qkvpacked` is empty).
+        raise RuntimeError(
+            "flash_attn_qkvpacked_func is not implemented by the SDPA shim; "
+            "unpack qkv and call flash_attn_func instead."
         )
 
     mod = types.ModuleType("flash_attn")
     mod.__doc__ = "SDPA-backed stand-in installed by ComfyUI-Matrix-Game."
     mod.flash_attn_func = flash_attn_func
     mod.flash_attn_varlen_func = flash_attn_varlen_func
-    mod.flash_attn_qkvpacked_func = flash_attn_func
+    mod.flash_attn_qkvpacked_func = flash_attn_qkvpacked_func
     # __spec__ is not optional. diffusers and transformers both probe with
     # importlib.util.find_spec("flash_attn") at import time, and find_spec
     # raises ValueError for a module that is in sys.modules with __spec__ None.

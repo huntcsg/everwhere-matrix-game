@@ -222,10 +222,55 @@ Checked every import in the tree (`grep -rn "flash_attn\|apex\|tensorrt\|pycuda\
   `matrixgame/model_variants/matrixgame_dit_src/_attn_compat.py` in the 1.0
   tree, but injected as a module so the vendored source stays byte-identical
   to upstream. If a real wheel is present it wins (`find_spec` check).
-* `wan/modules/attention.py` and `wan/vae/wanx_vae_src/attention.py` already
-  guard `flash_attn` / `flash_attn_interface` with `try/except
-  ModuleNotFoundError` and fall back to
-  `torch.nn.functional.scaled_dot_product_attention`. No change needed.
+* **`wan/modules/attention.py` and `wan/vae/wanx_vae_src/attention.py` needed
+  patching, and an earlier revision of this file was wrong to say they did
+  not.** Both open with
+
+  ```python
+  try:
+      import flash_attn
+      FLASH_ATTN_2_AVAILABLE = True
+  except ModuleNotFoundError:
+      FLASH_ATTN_2_AVAILABLE = False
+  ```
+
+  The `try/except` guards an *absent* flash-attn. It does not guard a shim: the
+  import succeeds, `FLASH_ATTN_2_AVAILABLE` becomes True, and both the
+  `attention()` router and `flash_attention()` itself go to
+  `flash_attn.flash_attn_varlen_func`, which the shim does not implement. The
+  shim made the two files' own SDPA fallbacks unreachable.
+
+  Both now test for the shim (`SDPA_SHIM`, or `__version__ == "0.0.0"`) and
+  report `FLASH_ATTN_2_AVAILABLE = False`, so `attention()` takes upstream's
+  own SDPA branch.
+
+  **Flipping the flag is not sufficient on its own**, which is the part that is
+  easy to miss. `flash_attention()` is not only reached through `attention()`
+  — `wan/vae/wanx_vae_src/clip.py:91,203` and `wan/modules/model.py:150,255`
+  call it *directly*, and with the flag False it would hit its own
+  `assert FLASH_ATTN_2_AVAILABLE` on line ~112. So `flash_attention()` also
+  got an early `_sdpa_attention()` branch, before the varlen packing, where
+  q/k/v are still `[B, L, N, C]`.
+
+  `_sdpa_attention` honours `softmax_scale`, `q_scale`, `causal`, `k_lens`
+  (as a key-padding mask) and `Nq % Nk == 0` head broadcasting, preserves the
+  input dtype on the way out, and **raises** rather than approximating for
+  `window_size != (-1, -1)` and for `causal` with `lq != lk` (FlashAttention
+  aligns a causal mask bottom-right when the lengths differ, `is_causal`
+  aligns top-left). No call site in this tree uses either, and wrong attention
+  is wrong video, which is worse than a crash.
+
+  Which one actually bites first: **`wan/vae/wanx_vae_src/attention.py`**.
+  `MatrixGame2ActionSampler.sample` calls `vae.clip.encode_video(image)`
+  before `pipe.inference`, and that is `CLIPModel` →
+  `VisionTransformer` → `SelfAttention` → `flash_attention(..., version=2)`
+  in the VAE's copy. `wan/modules/attention.py` is reached later, from
+  `causal_model.py:187`, and only through `attention()`.
+
+  Verified numerically against an explicit `softmax(QK^T·scale)V` reference
+  (not against SDPA, which would pass by construction) for both files and for
+  the shim's own `flash_attn_func`: `mg2/test_sdpa_fallback.py`, CPU torch is
+  enough. bf16 agreement ~4e-3, fp32 ~1e-7.
 * `flash_attn_interface` (FA3) is `try/except` everywhere. Left absent.
 * **apex** — not imported anywhere in the 2.0 tree, only mentioned in the
   README install steps. Nothing to guard.
@@ -254,15 +299,44 @@ Checked every import in the tree (`grep -rn "flash_attn\|apex\|tensorrt\|pycuda\
   `transformers` (`AutoTokenizer`), `einops`, `safetensors`, `ftfy`, `regex`,
   `PyYAML`, `torchvision`. `omegaconf` is **not** required — the node reads the
   yaml with PyYAML into a plain namespace. No numpy pin.
-* **The shim needs `__spec__`.** Both diffusers
-  (`diffusers/utils/import_utils.py`) and transformers probe with
-  `importlib.util.find_spec("flash_attn")` at *their* import time, and
-  `find_spec` raises `ValueError: flash_attn.__spec__ is None` for a module
-  that sits in `sys.modules` without one. The shim therefore carries a real
-  `ModuleSpec` and `__version__ = "0.0.0"`, which keeps both libraries'
-  `>= 2.1.0` FlashAttention-2 gates closed — they route around flash-attn
-  exactly as if it were absent. Found by running it: without `__spec__`,
-  `import diffusers` fails outright.
+* **The shim needs `__spec__`.** transformers probes with
+  `importlib.util.find_spec("flash_attn")`, and `find_spec` raises
+  `ValueError: flash_attn.__spec__ is None` for a module that sits in
+  `sys.modules` without one. The shim therefore carries a real `ModuleSpec`.
+
+  What actually keeps the FlashAttention-2 gates closed is **not**
+  `__version__`. transformers 4.47.1's `_is_package_available` calls
+  `importlib.metadata.version("flash_attn")`, which raises
+  `PackageNotFoundError` because no distribution is installed, and the helper
+  then reports the package absent — so `is_flash_attn_2_available()`,
+  `is_flash_attn_greater_or_equal_2_10()` and `is_flash_attn_greater_or_equal()`
+  all answer False. Checked by running transformers' own logic against the
+  installed shim. `__version__ = "0.0.0"` is therefore only a shim *marker*,
+  which is why the vendored patch keys off `SDPA_SHIM` first and treats
+  `"0.0.0"` as a secondary tell.
+
+  diffusers 0.32.2 (the pinned version) contains **zero** `flash_attn`
+  references — `grep -rn flash_attn` over the wheel is empty — so the earlier
+  note blaming diffusers for the `__spec__` requirement was wrong about which
+  library probes. peft 0.14.0 likewise has none.
+
+* **ComfyUI core has the same pattern and is safe only by ordering.**
+  `comfy/ldm/modules/attention.py:47` does `from flash_attn import
+  flash_attn_func` at module scope and sets `FLASH_ATTENTION_IS_AVAILABLE`.
+  That runs at ComfyUI startup, long before `_load_mg2()` installs the shim on
+  first node execution, so ComfyUI records flash-attn as absent and keeps it
+  that way; it is additionally only used behind `--use-flash-attention`.
+  **Do not move the shim installation to import time** — it would flip
+  ComfyUI's own flag and route unrelated models into an SDPA stand-in.
+
+* `flash_attn_qkvpacked_func` used to be aliased to the shim's
+  `flash_attn_func`. The real one takes a single packed `[B, L, 3, H, D]`
+  tensor, so the alias was a wrong-signature trap; it now raises. Nothing in
+  the tree calls it (`grep -rn qkvpacked` is empty).
+
+* `wan/utils/prompt_extend.py:17` also imports `flash_attn_varlen_func`, in a
+  `try/except`. Nothing imports that module (only `wan/__init__.py` would, and
+  it never runs), so the name binds to the raising stub and is never called.
 * **`wan/modules/t5.py` demands a GPU at import time.** Line 478 calls
   `torch.cuda.current_device()` in a *class body*, so merely executing
   `wan/modules/__init__.py` (which does `from .t5 import ...`) raises
@@ -310,12 +384,22 @@ A side benefit: `wan` is claimed as a synthesised namespace package, so
 ## 6. Vendored source
 
 `mg2/Matrix-Game-2/` is `wan/`, `utils/`, `pipeline/`, `demo_utils/` and
-`configs/` copied **verbatim** from the official repo (MIT), so it stays
-diffable against upstream:
+`configs/` copied from the official repo (MIT) so it stays diffable against
+upstream. **Two files carry a local patch**, each marked `LOCAL PATCH` at
+every hunk:
 
 ```
-diff -r <official>/Matrix-Game-2/wan mg2/Matrix-Game-2/wan     # no output
+wan/modules/attention.py              shim detection + flash_attention SDPA fallback
+wan/vae/wanx_vae_src/attention.py     same
+diff -r <official>/Matrix-Game-2 mg2/Matrix-Game-2   # only those two files
 ```
+
+Both patches are additive — a new `_sdpa_attention` helper, one changed
+assignment in the `import flash_attn` guard, and one early-return branch. No
+upstream line was deleted and `attention()`'s own SDPA branch is untouched, so
+a future upstream bump can drop the patch the moment a real flash-attn wheel
+is in the image (the guard then reports True again and nothing else changes).
+See §4 for why it is needed.
 
 It is vendored rather than referenced because the deployment image stages the
 ComfyUI tree, not the sibling Matrix-Game clone. The loader still prefers an
@@ -359,6 +443,14 @@ during it.
 
 Verified on this box (no GPU, CPU-only torch 2.14 + diffusers 0.40 +
 transformers 5.17 installed for the purpose):
+
+* `mg2/test_sdpa_fallback.py` passes: 24 numeric and behavioural checks over
+  both patched `attention.py` files and the installed shim, against an
+  explicit `softmax(QK^T·scale)V` reference rather than against SDPA. Covers
+  the exact call shapes this tree produces — clip self-attention (`lq == lk`),
+  clip attention-pool (`lq = 1`), the causal-model KV-cache window
+  (`lq != lk`), `softmax_scale`, `q_scale`, `k_lens`, GQA head broadcasting,
+  dtype round-trip — and asserts the two unsupported cases raise;
 
 * the required import check passes with **no torch at all installed** — every
   heavy import in `matrixgame2_nodes.py` is deferred to execution, so

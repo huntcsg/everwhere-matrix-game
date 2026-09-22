@@ -15,7 +15,18 @@ except ModuleNotFoundError:
 
 try:
     import flash_attn
-    FLASH_ATTN_2_AVAILABLE = True
+    # LOCAL PATCH (ComfyUI-Matrix-Game). flash-attn needs a CUDA compiler at
+    # install time, so the deployment image does not have it and
+    # matrixgame2_nodes._install_flash_attn_shim() registers an SDPA-backed
+    # stand-in in sys.modules to satisfy action_module's module-scope
+    # ``from flash_attn import flash_attn_func``. That stand-in has no varlen
+    # kernel, so it must not be reported as FlashAttention-2: otherwise this
+    # import succeeds, attention() routes into flash_attention(), and
+    # flash_attn.flash_attn_varlen_func raises. Treat the stand-in as absent
+    # so the SDPA paths below run instead.
+    FLASH_ATTN_2_AVAILABLE = not (
+        getattr(flash_attn, 'SDPA_SHIM', False)
+        or getattr(flash_attn, '__version__', '') == '0.0.0')
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
@@ -26,6 +37,84 @@ __all__ = [
     'flash_attention',
     'attention',
 ]
+
+
+def _sdpa_attention(
+    q,
+    k,
+    v,
+    q_lens=None,
+    k_lens=None,
+    dropout_p=0.,
+    softmax_scale=None,
+    q_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    dtype=torch.bfloat16,
+):
+    """LOCAL PATCH: scaled_dot_product_attention stand-in for flash_attention.
+
+    Same [B, L, N, C] in/out contract as flash_attention. attention() has its
+    own SDPA branch, but clip.py (and model.py) call flash_attention directly,
+    so the fallback has to live here too.
+
+    Only the argument combinations this tree actually uses are supported;
+    anything SDPA cannot express faithfully raises rather than quietly
+    returning a different result.
+    """
+    b, lq, nq = q.size(0), q.size(1), q.size(2)
+    lk, nk = k.size(1), k.size(2)
+    out_dtype = q.dtype
+
+    if window_size != (-1, -1):
+        raise NotImplementedError(
+            'sliding-window attention has no scaled_dot_product_attention '
+            f'equivalent (window_size={window_size})')
+    if causal and lq != lk:
+        # FlashAttention aligns a causal mask to the bottom right when the
+        # query and key lengths differ; is_causal aligns it to the top left.
+        # Silently picking the wrong one would corrupt the output, so refuse.
+        raise NotImplementedError(
+            f'causal attention with lq={lq} != lk={lk} needs a bottom-right '
+            'aligned mask, which is_causal does not provide')
+    if q_lens is not None:
+        # flash_attention's own packed-return path cannot express non-uniform
+        # q_lens either: it unflattens the packed output to (b, lq).
+        warnings.warn(
+            'Padding mask is disabled when using '
+            'scaled_dot_product_attention. It can have a significant impact '
+            'on performance.')
+
+    q = q.to(dtype)
+    k = k.to(dtype)
+    v = v.to(dtype)
+    if q_scale is not None:
+        q = q * q_scale
+    if nq != nk:
+        assert nq % nk == 0, f'Nq ({nq}) must be divisible by Nk ({nk})'
+        k = k.repeat_interleave(nq // nk, dim=2)
+        v = v.repeat_interleave(nq // nk, dim=2)
+
+    attn_mask = None
+    if k_lens is not None:
+        # [B, 1, 1, Lk] boolean: drop each sequence's padding key columns.
+        positions = torch.arange(lk, device=k.device)
+        valid = positions[None, :] < k_lens.to(k.device).reshape(b, 1)
+        attn_mask = valid[:, None, None, :]
+        if causal:
+            raise NotImplementedError(
+                'k_lens together with causal would need the two masks merged')
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=causal if attn_mask is None else False,
+        scale=softmax_scale,
+    )
+    return out.transpose(1, 2).contiguous().type(out_dtype)
 
 
 def flash_attention(
@@ -56,6 +145,23 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        # LOCAL PATCH: no flash-attn kernel in this image. Direct callers
+        # (clip.py, model.py) never reach attention()'s own SDPA branch.
+        return _sdpa_attention(
+            q=q,
+            k=k,
+            v=v,
+            q_lens=q_lens,
+            k_lens=k_lens,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            q_scale=q_scale,
+            causal=causal,
+            window_size=window_size,
+            dtype=dtype,
+        )
+
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
