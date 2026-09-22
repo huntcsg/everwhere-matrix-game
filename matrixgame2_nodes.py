@@ -704,10 +704,36 @@ class MatrixGame2PipelineLoader:
         # plain torch.load from vae_dir; the tokenizer dir is local too.
         clip_ckpt = os.path.join(
             vae_dir, "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth")
+        # get_wanx_vae_wrapper joins ONE directory with all three of
+        # Wan2.1_VAE.pth, the clip .pth and xlm-roberta-large/. The tokenizer
+        # is four small json/model files, which the build scanner does not
+        # treat as models and so never stages -- the staged volume has the two
+        # .pth files and no tokenizer. It is 22MB, so it is vendored here, and
+        # when the staged tree lacks it we compose a shadow directory of
+        # symlinks so all three live under one path. The staged volume may be
+        # read-only, hence a temp dir rather than writing next to the weights.
         tokenizer_dir = os.path.join(vae_dir, "xlm-roberta-large")
-        for p in (clip_ckpt, tokenizer_dir):
-            if not os.path.exists(p):
-                raise FileNotFoundError(f"missing {p}")
+        if not os.path.exists(clip_ckpt):
+            raise FileNotFoundError(f"missing {clip_ckpt}")
+        if not os.path.isdir(tokenizer_dir):
+            vendored = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "mg2", "tokenizer", "xlm-roberta-large")
+            if not os.path.isdir(vendored):
+                raise FileNotFoundError(
+                    f"missing tokenizer dir: tried {tokenizer_dir} and {vendored}")
+            import tempfile
+            shadow = os.path.join(tempfile.gettempdir(), "mg2_vae_dir")
+            os.makedirs(shadow, exist_ok=True)
+            for name, target in (
+                ("Wan2.1_VAE.pth", os.path.join(vae_dir, "Wan2.1_VAE.pth")),
+                (os.path.basename(clip_ckpt), clip_ckpt),
+                ("xlm-roberta-large", vendored),
+            ):
+                link = os.path.join(shadow, name)
+                if not os.path.exists(link):
+                    os.symlink(target, link)
+            vae_dir = shadow
         vae = mg["get_wanx_vae_wrapper"](vae_dir, torch.float16)
         vae.requires_grad_(False)
         vae.eval()
