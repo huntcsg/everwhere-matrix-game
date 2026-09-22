@@ -1,6 +1,6 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
-from flash_attn import flash_attn_func
+from ._attn_compat import flash_attn_func  # falls back to SDPA
 import torch
 import torch.nn as nn
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer

@@ -10,6 +10,13 @@ try:
 except ImportError:
     flash_attn_varlen_func = None
 
+# `flash_attn` is optional (see _attn_compat); guard the bare module
+# reference further down so importing this file never requires the wheel.
+try:
+    import flash_attn
+except Exception:  # noqa: BLE001
+    flash_attn = None
+
 
 MEMORY_LAYOUT = {
     "flash": (
@@ -198,7 +205,7 @@ def parallel_attention(
         joint_tensor_value=v[:,img_kv_len:cu_seqlens_kv[1]],
         joint_strategy="rear",
     )
-    if flash_attn.__version__ >= '2.7.0':
+    if flash_attn is not None and flash_attn.__version__ >= '2.7.0':
         attn2, *_ = _flash_attn_forward(
             q[:,cu_seqlens_q[1]:],
             k[:,cu_seqlens_kv[1]:],
