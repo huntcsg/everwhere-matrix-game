@@ -65,4 +65,16 @@ from .everwhere_nodes import (  # noqa: E402
 NODE_CLASS_MAPPINGS.update(_EW_CLASSES)
 NODE_DISPLAY_NAME_MAPPINGS.update(_EW_NAMES)
 
+# --- Matrix-Game 2.0 nodes: required ---------------------------------------
+# A separate architecture from 1.0 (causal Wan2.1 DiT + action module), so a
+# separate module. Its heavy imports are deferred to execution time, which is
+# why this import is safe at load.
+from .matrixgame2_nodes import (  # noqa: E402
+    NODE_CLASS_MAPPINGS as _MG2_CLASSES,
+    NODE_DISPLAY_NAME_MAPPINGS as _MG2_NAMES,
+)
+
+NODE_CLASS_MAPPINGS.update(_MG2_CLASSES)
+NODE_DISPLAY_NAME_MAPPINGS.update(_MG2_NAMES)
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
