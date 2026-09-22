@@ -37,7 +37,17 @@ try:
 except ImportError:
     HAVE_FUSED_LAYER_NORM = False
 
-from apex.normalization.fused_layer_norm import fused_layer_norm
+# Unlike the three guarded imports above, this one was unconditional and made
+# the whole module require apex -- which needs a CUDA compiler and is absent
+# from the base image. It is only reached on the non-affine path, so fall back
+# to torch's own layer_norm, which is numerically equivalent here.
+try:
+    from apex.normalization.fused_layer_norm import fused_layer_norm
+except ImportError:
+    import torch.nn.functional as _F
+
+    def fused_layer_norm(input, normalized_shape, eps, memory_efficient=False):
+        return _F.layer_norm(input, normalized_shape, None, None, eps)
 
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
