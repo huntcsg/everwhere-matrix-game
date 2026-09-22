@@ -444,7 +444,7 @@ during it.
 Verified on this box (no GPU, CPU-only torch 2.14 + diffusers 0.40 +
 transformers 5.17 installed for the purpose):
 
-* `mg2/test_sdpa_fallback.py` passes: 24 numeric and behavioural checks over
+* `mg2/test_sdpa_fallback.py` passes: 30 numeric and behavioural checks over
   both patched `attention.py` files and the installed shim, against an
   explicit `softmax(QK^T·scale)V` reference rather than against SDPA. Covers
   the exact call shapes this tree produces — clip self-attention (`lq == lk`),
